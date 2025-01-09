@@ -169,3 +169,8 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# SMPL models
+body_models/
+smplx/
+aitviewer/ 
