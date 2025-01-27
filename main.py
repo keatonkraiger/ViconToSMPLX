@@ -2,7 +2,7 @@
 Integration of Vicon marker data with SMPLify-X optimization pipeline.
 Processes single mocap files and handles marker-to-SMPLX conversion.
 """
-
+from utils.rotation_conversion import aa2rot_torch
 import argparse
 import sys
 import time
@@ -13,12 +13,13 @@ import numpy as np
 import torch
 from scipy.io import loadmat
 from smplx import SMPLXLayer
+#from mmhuman3d.core.visualization import visualize_smpl_pose
 
 from smplifyx.optimize import multi_stage_optimize
 from smplifyx.loss import *
-from utils.io import write_smplx
+from utils.io import write_smplx, save_as_obj
 from utils.torch_utils import init_params
-from utils.visualize_smplx import visualize_smplx_model
+#from utils.visualize_smplx import visualize_smplx_model
 from utils.vicon_mapping import ViconJointRegressor, create_joint_regressor
 
 def load_mocap_data(mocap_file):
@@ -70,7 +71,8 @@ def main(args):
     # Load mocap data
     print(f'Loading mocap data from: {args.mocap_file}')
     marker_data = load_mocap_data(args.mocap_file)
-    marker_data = marker_data[:1000,...]
+    # Take every Nth frame
+    marker_data = marker_data
     num_frames = marker_data.shape[0]
     print(f'Loaded {num_frames} frames of motion data')
     
@@ -119,12 +121,41 @@ def main(args):
     end_time = time.time()
     print(f'Optimization completed in {end_time - start_time:.2f} seconds')
 
-    # Save results
     if args.output_file:
         write_smplx(optimized_params, args.output_file)
         print(f'Results saved to: {args.output_file}')
+         
+    if args.save_obj:
+        smplx_model = SMPLXLayer(model_path=args.model_folder, gender='neutral')
+        global_orient_mat = aa2rot_torch(params['global_orient'])     
+        global_orient_mat = global_orient_mat.unsqueeze(1)  # [100, 1, 3, 3]
+        body_pose = params['body_pose']
+        body_pose_mat = aa2rot_torch(body_pose.reshape(-1, 3)).reshape(-1, 21, 3, 3)  # [100, 21, 3, 3] 
+        transl = torch.tensor(params['transl'])  # [100, 3]
+        betas = torch.tensor(params['betas'])  # [100, 10]
+        # move each mat to cpu
+        global_orient_mat = global_orient_mat.cpu()
+        body_pose_mat = body_pose_mat.cpu()
+        transl = transl.cpu()
+        betas = betas.cpu()
+    
+        output = smplx_model(
+            betas=betas,
+            global_orient=global_orient_mat,
+            body_pose=body_pose_mat,
+            transl=transl
+            )
+    
+        vertices = output.vertices.cpu().numpy()
+        faces = smplx_model.faces  # [F, 3]
+        output_file = "smplx_output_frame_0.obj"
+        breakpoint()
+        save_as_obj(output_file, vertices[0], faces)
+        
+
 
     # Visualize if requested
+    '''
     if args.visualize:
         print('Visualizing results...')
         visualize_smplx_model(
@@ -132,7 +163,7 @@ def main(args):
             args.gender,
             joint_positions if args.vis_joints else None,
             args.vis_joints
-        )
+        )'''
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process mocap data through SMPLify-X')
@@ -150,6 +181,7 @@ if __name__ == '__main__':
                         help='Visualize results')
     parser.add_argument('--vis_joints', action='store_true',
                         help='Visualize estimated joint positions')
-    
+    parser.add_argument('--save_obj', action='store_false',
+                        help='Save results as .obj files')    
     args = parser.parse_args()
     main(args)

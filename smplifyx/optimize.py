@@ -8,29 +8,11 @@ from smplifyx.loss import *
 from utils.rotation_conversion import aa2rot_torch
 from utils.vicon_mapping import VICON_JOINT_LIMBS
 
-def multi_stage_optimize(params,body_models,kp3ds):
-    """
-    kp3ds: nf,nj,4
-
-    Multi-stage optimizing
-    1. Shape
-    2. Global orient and transl
-    3. Poses
-    """
-    # Use pre-computed shape, otherwise `optimize_shape` can be used
-
-    # optimize RT
-    params=optimize_pose(params,body_models,kp3ds,
-                         OPT_RT=True)
-
-    # optimize body poses
-    params=optimize_pose(params,body_models,kp3ds,
-                         OPT_RT=True,OPT_POSE=True)
-    
-    # optimize hand poses
-    params=optimize_pose(params,body_models,kp3ds,
-                        OPT_RT=False,OPT_POSE=True,OPT_HAND=True)
-    
+def multi_stage_optimize(params, body_models, kp3ds):
+    params = optimize_shape(params, body_models, kp3ds)
+    params = optimize_pose(params, body_models, kp3ds, OPT_RT=True)
+    params = optimize_pose(params, body_models, kp3ds, OPT_RT=True, OPT_POSE=True)
+    params = optimize_pose(params, body_models, kp3ds, OPT_RT=False, OPT_POSE=True, OPT_HAND=True)
     return params
 
 def optimize_pose(params,body_models,kp3ds,
@@ -68,6 +50,7 @@ def optimize_pose(params,body_models,kp3ds,
         desc='Optimizing Expression...'
 
     optimizer=LBFGS(opt_params,line_search_fn='strong_wolfe',max_iter=30)
+    
     def closure(debug=False):
         optimizer.zero_grad()
         axis_angle=torch.cat([params['global_orient'][:,None,:],
@@ -108,71 +91,80 @@ def optimize_pose(params,body_models,kp3ds,
 
     return params
         
-def optimize_shape(params,body_models,kp3ds):
-    nf=kp3ds.shape[0]
+def optimize_shape(params, body_models, kp3ds):
+    nf = kp3ds.shape[0]
 
-    start=torch.tensor(np.array(VICON_JOINT_LIMBS)[:,0],device='cuda')
-    end=torch.tensor(np.array(VICON_JOINT_LIMBS)[:,1],device='cuda')
-    start_kp3d=torch.index_select(kp3ds,1,start) # nf,nlimbs,4
-    end_kp3d=torch.index_select(kp3ds,1,end)
-    # nf,nlimbs,1
-    limb_length=torch.norm(start_kp3d[...,:3]-end_kp3d[...,:3],dim=2,keepdim=True) 
-    # nf,nlimbs,1
-    limb_conf=torch.minimum(start_kp3d[...,3],end_kp3d[...,3])[...,None]
+    start = torch.tensor(np.array(VICON_JOINT_LIMBS)[:, 0], device='cuda')
+    end = torch.tensor(np.array(VICON_JOINT_LIMBS)[:, 1], device='cuda')
+    start_kp3d = torch.index_select(kp3ds, 1, start)  # nf, nlimbs, 4
+    end_kp3d = torch.index_select(kp3ds, 1, end)
+    # nf, nlimbs, 1
+    limb_length = torch.norm(start_kp3d[..., :3] - end_kp3d[..., :3], dim=2, keepdim=True)
+    # nf, nlimbs, 1
+    limb_conf = torch.minimum(start_kp3d[..., 3], end_kp3d[..., 3])[..., None]
 
-    opt_params=[params['betas']]
-    optimizer=LBFGS(opt_params,line_search_fn='strong_wolfe',max_iter=30)
+    opt_params = [params['betas']]
+    optimizer = LBFGS(opt_params, line_search_fn='strong_wolfe', max_iter=30)
 
     def closure(debug=False):
         optimizer.zero_grad()
-        axis_angle=torch.cat([params['global_orient'][:,None,:],
-                            params['body_pose'],
-                            params['leye_pose'][:,None,:],
-                            params['reye_pose'][:,None,:],
-                            params['jaw_pose'][:,None,:],
-                            params['lhand_pose'],
-                            params['rhand_pose']
-                            ],axis=1).reshape((-1,3)) # nf*55,3
-        rot_mat=aa2rot_torch(axis_angle).reshape((nf,-1,3,3)) # nf,55,3,3
-        out_kp3d=body_models(
+
+        # Combine poses to construct the body model
+        axis_angle = torch.cat([
+            params['global_orient'][:, None, :],
+            params['body_pose'],
+            params['leye_pose'][:, None, :],
+            params['reye_pose'][:, None, :],
+            params['jaw_pose'][:, None, :],
+            params['lhand_pose'],
+            params['rhand_pose']
+        ], axis=1).reshape((-1, 3))  # nf*55,3
+        
+        rot_mat = aa2rot_torch(axis_angle).reshape((nf, -1, 3, 3))  # nf,55,3,3
+        
+        out_kp3d = body_models(
             betas=params['betas'],
             expression=params['expression'],
             transl=params['transl'],
-            global_orient=rot_mat[:,0,...],
-            body_pose=rot_mat[:,1:22,...],
-            leye_pose=rot_mat[:,22,...],
-            reye_pose=rot_mat[:,23,...],
-            jaw_pose=rot_mat[:,24,...],
-            left_hand_pose=rot_mat[:,25:40,...],
-            right_hand_pose=rot_mat[:,40:55,...]
-        ).joints # nf,nj(JOINT_MAPPER),3
-        out_start_kp3d=torch.index_select(out_kp3d,1,start)
-        out_end_kp3d=torch.index_select(out_kp3d,1,end)
-        out_dist=(out_start_kp3d[...,:3]-out_end_kp3d[...,:3]).detach()
-        out_dist_norm=torch.norm(out_dist,dim=2,keepdim=True) 
-        out_dist_normalized=out_dist/(out_dist_norm+1e-4)
-        err=(out_start_kp3d[...,:3]-out_end_kp3d[...,:3])\
-            -out_dist_normalized*limb_length
-        loss_dict={
-            'shape3d':Loss_shape3d(err,limb_conf,nf),
-            'reg_shape':Loss_reg_shape(params['betas'])
+            global_orient=rot_mat[:, 0, ...],
+            body_pose=rot_mat[:, 1:22, ...],
+            leye_pose=rot_mat[:, 22, ...],
+            reye_pose=rot_mat[:, 23, ...],
+            jaw_pose=rot_mat[:, 24, ...],
+            left_hand_pose=rot_mat[:, 25:40, ...],
+            right_hand_pose=rot_mat[:, 40:55, ...]
+        ).joints  # nf, nj(JOINT_MAPPER), 3
+
+        # Compute loss
+        out_start_kp3d = torch.index_select(out_kp3d, 1, start)
+        out_end_kp3d = torch.index_select(out_kp3d, 1, end)
+        out_dist = (out_start_kp3d[..., :3] - out_end_kp3d[..., :3]).detach()
+        out_dist_norm = torch.norm(out_dist, dim=2, keepdim=True)
+        out_dist_normalized = out_dist / (out_dist_norm + 1e-4)
+        err = (out_start_kp3d[..., :3] - out_end_kp3d[..., :3]) - out_dist_normalized * limb_length
+
+        # Define loss dictionary for shape optimization
+        loss_dict = {
+            'shape3d': Loss_shape3d(err, limb_conf, nf),
+            'reg_shape': Loss_reg_shape(params['betas'])
         }
-        loss_weight=OPTIMIZE_SHAPE
-        loss=sum([loss_dict[key]*loss_weight[key] 
-                  for key in loss_dict.keys()])
-    
+        
+        loss_weight = OPTIMIZE_SHAPE  # Use a predefined weight dictionary
+        loss = sum([loss_dict[key] * loss_weight[key] for key in loss_dict.keys()])
+
         if not debug:
             loss.backward()
             return loss
         else:
             return loss_dict
-    final_loss=run_fitting(optimizer,closure,opt_params,"Optimizing shape...")
-    loss_dict=closure(True)
+
+    final_loss = run_fitting(optimizer, closure, opt_params, "Optimizing shape...")
+    loss_dict = closure(True)
     for key in loss_dict.keys():
-        print("%s : %f"%(key,loss_dict[key].item()))
+        print("%s : %f" % (key, loss_dict[key].item()))
     return params
 
-def run_fitting(optimizer,closure,opt_params,desc,maxiters=50,ftol=1e-9):
+def run_fitting(optimizer,closure,opt_params,desc,maxiters=200,ftol=1e-9):
     prev_loss=None
     require_grad(opt_params,True)
     for iter in tqdm(range(maxiters),desc=desc):
